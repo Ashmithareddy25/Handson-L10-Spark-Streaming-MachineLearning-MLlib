@@ -1,99 +1,80 @@
-import os
+# ===========================================================
+# ITCS 6190/8190 - Spark Structured Streaming with MLlib
+# Task 4: Real-Time Fare Prediction
+# ===========================================================
+
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col, abs as abs_diff
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType
+from pyspark.sql.functions import col, abs as abs_diff, from_json
+from pyspark.sql.types import StructType, StructField, DoubleType, StringType, TimestampType
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.regression import LinearRegression, LinearRegressionModel
 
-# Import necessary MLlib classes
-# TODO: Import VectorAssembler, LinearRegression, and LinearRegressionModel
+# -----------------------------------------------------------
+# STEP 1: Initialize Spark session
+# -----------------------------------------------------------
+spark = SparkSession.builder \
+    .appName("Task4_RealTime_Fare_Prediction") \
+    .getOrCreate()
+spark.sparkContext.setLogLevel("ERROR")
 
-# Create Spark Session
-spark = SparkSession.builder.appName("Task4_FarePrediction_Assignment").getOrCreate()
-spark.sparkContext.setLogLevel("WARN")
+# -----------------------------------------------------------
+# STEP 2: Train and save model using static CSV
+# -----------------------------------------------------------
+print("=== Training model using training-dataset.csv ===")
 
-# Define paths for the model and training data
-MODEL_PATH = "models/fare_model"
-TRAINING_DATA_PATH = "training-dataset.csv"
+train_df = spark.read.csv("training-dataset.csv", header=True, inferSchema=True)
+assembler = VectorAssembler(inputCols=["distance_km"], outputCol="features")
+train_vec = assembler.transform(train_df)
 
-# --- PART 1: MODEL TRAINING (Offline) ---
-# This part trains the model only if it doesn't already exist.
-if not os.path.exists(MODEL_PATH):
-    print(f"\n[Training Phase] No model found. Training a new model using {TRAINING_DATA_PATH}...")
+lr = LinearRegression(featuresCol="features", labelCol="fare_amount")
+model = lr.fit(train_vec)
 
-    # Load the training data from the provided CSV file
-    train_df_raw = spark.read.csv(TRAINING_DATA_PATH, header=True, inferSchema=False)
+# Save trained model
+model.write().overwrite().save("models/fare_model")
+print("✅ Model trained and saved to models/fare_model")
 
-    # TODO: Cast `distance_km` and `fare_amount` columns to DoubleType for ML
-    # HINT: Use the .withColumn() and .cast() methods.
-    train_df = None # Replace None with your implementation
+# -----------------------------------------------------------
+# STEP 3: Load model for real-time prediction
+# -----------------------------------------------------------
+loaded_model = LinearRegressionModel.load("models/fare_model")
 
-    # TODO: Create a VectorAssembler to combine feature columns into a single 'features' vector.
-    # The input column should be 'distance_km'.
-    assembler = None # Replace None with your implementation
-    train_data_with_features = None # Replace None with your implementation
-
-    # TODO: Create a LinearRegression model instance.
-    # Set the features column to 'features' and the label column to 'fare_amount'.
-    lr = None # Replace None with your implementation
-
-    # TODO: Train the model by fitting it to the training data.
-    model = None # Replace None with your implementation
-
-    # TODO: Save the trained model to the specified MODEL_PATH.
-    # HINT: Use the .write().overwrite().save() methods.
-    print(f"[Training Complete] Model saved to -> {MODEL_PATH}")
-else:
-    print(f"[Model Found] Using existing model from {MODEL_PATH}")
-
-
-# --- PART 2: STREAMING INFERENCE ---
-print("\n[Inference Phase] Starting real-time fare prediction stream...")
-
-# Define the schema for the incoming streaming data
+# Define schema of incoming stream
 schema = StructType([
-    StructField("trip_id", StringType()),
-    StructField("driver_id", IntegerType()),
-    StructField("distance_km", DoubleType()),
-    StructField("fare_amount", DoubleType()),
-    StructField("timestamp", StringType())
+    StructField("ride_id", StringType(), True),
+    StructField("timestamp", TimestampType(), True),
+    StructField("distance_km", DoubleType(), True),
+    StructField("fare_amount", DoubleType(), True)
 ])
 
-# Read streaming data from the socket
-raw_stream = spark.readStream.format("socket") \
+# -----------------------------------------------------------
+# STEP 4: Read streaming data from socket
+# -----------------------------------------------------------
+print("=== Waiting for streaming data from localhost:9999 ===")
+stream_df = spark.readStream.format("socket") \
     .option("host", "localhost") \
     .option("port", 9999) \
     .load()
 
-# Parse the incoming JSON data from the stream
-parsed_stream = raw_stream.select(from_json(col("value"), schema).alias("data")).select("data.*")
+# Parse JSON lines coming from data_generator.py
+parsed_df = stream_df.select(from_json(col("value"), schema).alias("data")).select("data.*")
 
-# TODO: Load the pre-trained LinearRegressionModel from MODEL_PATH.
-model = None # Replace None with your implementation
+# -----------------------------------------------------------
+# STEP 5: Apply model to predict fare
+# -----------------------------------------------------------
+assembled_stream = VectorAssembler(inputCols=["distance_km"], outputCol="features").transform(parsed_df)
+pred_df = loaded_model.transform(assembled_stream)
 
-# TODO: Use a VectorAssembler to transform the `distance_km` column of the streaming data
-# into a 'features' vector. This must be the same transformation as in the training phase.
-assembler_inference = None # Replace None with your implementation
-stream_with_features = None # Replace None with your implementation
+# Compute deviation (difference between actual and predicted fare)
+result_df = pred_df.withColumn("deviation", abs_diff(col("fare_amount") - col("prediction")))
 
-# TODO: Use the loaded model to make predictions on the streaming data.
-# HINT: Use model.transform()
-predictions = None # Replace None with your implementation
-
-# TODO: Calculate the 'deviation' between the actual 'fare_amount' and the 'prediction'.
-# HINT: Use withColumn and the abs_diff function.
-predictions_with_deviation = None # Replace None with your implementation
-
-# Select the final columns to display in the output
-output_df = predictions_with_deviation.select(
-    "trip_id", "driver_id", "distance_km", "fare_amount",
-    col("prediction").alias("predicted_fare"), "deviation"
-)
-
-# Write the final results to the console
-query = output_df.writeStream \
-    .format("console") \
+# -----------------------------------------------------------
+# STEP 6: Display output on console
+# -----------------------------------------------------------
+query = result_df.select("ride_id", "distance_km", "fare_amount", "prediction", "deviation") \
+    .writeStream \
     .outputMode("append") \
+    .format("console") \
     .option("truncate", False) \
     .start()
 
-# Wait for the streaming query to terminate
 query.awaitTermination()
